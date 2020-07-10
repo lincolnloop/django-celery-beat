@@ -1,5 +1,6 @@
 """Beat Scheduler Implementation."""
 import datetime
+import heapq
 import logging
 import math
 
@@ -7,7 +8,7 @@ from multiprocessing.util import Finalize
 
 from celery import current_app
 from celery import schedules
-from celery.beat import Scheduler, ScheduleEntry
+from celery.beat import Scheduler, ScheduleEntry, event_t
 from celery.utils.encoding import safe_str, safe_repr
 from celery.utils.log import get_logger
 from celery.utils.time import maybe_make_aware
@@ -120,14 +121,6 @@ class ModelEntry(ScheduleEntry):
                     (self.model.start_time - now).total_seconds()
                 )
                 return schedules.schedstate(False, delay)
-
-        # ONE OFF TASK: Disable one off tasks after they've ran once
-        if self.model.one_off and self.model.enabled \
-                and self.model.total_run_count > 0:
-            self.model.enabled = False
-            self.model.no_changes = False  # Mark the model entry as changed
-            self.model.save()
-            return schedules.schedstate(False, None)  # Don't recheck
 
         # CAUTION: make_aware assumes settings.TIME_ZONE for naive datetimes,
         # while maybe_make_aware assumes utc for naive datetimes
@@ -369,3 +362,52 @@ class DatabaseScheduler(Scheduler):
                     repr(entry) for entry in self._schedule.values()),
                 )
         return self._schedule
+
+    def apply_async(self, entry, *args, **kwargs):
+        result = super(DatabaseScheduler, self).apply_async(entry, *args, **kwargs)
+
+        if entry.model.one_off:
+            debug(f"Disabling one of task {entry.task}")
+            entry.model.enabled = False
+            entry.model.no_changes = False  # Mark the model entry as changed
+            entry.model.save()
+
+        return result
+
+    def tick(self, event_t=event_t, min=min, heappop=heapq.heappop,
+             heappush=heapq.heappush):
+        """Run a tick - one iteration of the scheduler.
+
+        Executes one due task per call.
+
+        Returns:
+            float: preferred delay in seconds for next call.
+        """
+        adjust = self.adjust
+        max_interval = self.max_interval
+
+        if self._heap is None or len(self._heap) == 0:
+            self.populate_heap()
+
+        H = self._heap
+
+        if not H:
+            return max_interval
+
+        event = H[0]
+        entry = event[2]
+        is_due, next_time_to_run = self.is_due(entry)
+        if is_due:
+            verify = heappop(H)
+            if verify is event:
+                next_entry = self.reserve(entry)
+                self.apply_entry(entry, producer=self.producer)
+                heappush(H, event_t(self._when(next_entry, next_time_to_run),
+                                    event[1], next_entry))
+                return 0
+            else:
+                heappush(H, verify)
+                self._heap = None
+                return min(verify[0], max_interval)
+        self._heap = None
+        return min(adjust(next_time_to_run) or max_interval, max_interval)
